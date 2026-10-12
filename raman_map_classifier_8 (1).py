@@ -42,6 +42,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -76,6 +77,8 @@ matplotlib.rcParams["mathtext.bf"] = "sans:bold"
 import logging as _logging
 _logging.getLogger("matplotlib.font_manager").setLevel(_logging.ERROR)
 import matplotlib.patches as mpatches
+import matplotlib.ticker
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -91,6 +94,18 @@ def side_colorbar(fig, ax, mappable, size="4%", pad=0.08):
     return fig.colorbar(mappable, cax=cax)
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+# Lorentzian G/2D fits and the 1L/2L reference + prediction live next to
+# this script; the tab that uses them is simply disabled if they are missing.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import raman_peak_fit as rpf
+    import graphene_reference as gref
+    import raman_tools as rt
+    import strain_doping as sd
+    HAVE_GREF = True
+except Exception:                                    # pragma: no cover
+    HAVE_GREF = False
 
 #: np.trapezoid is NumPy >= 2.0; np.trapz is the 1.x spelling.
 _trapz = getattr(np, "trapezoid", None) or np.trapz
@@ -550,6 +565,124 @@ def _parse_image(path, header, body, axis, roles) -> MapFile:
 
     return MapFile(axis=xs, x=xs, y=ys, data=np.empty((0, 0)), path=path,
                    header=header, layout="image", image=img)
+
+
+# ---------------------------------------------------------------------------
+# Single spectra and one-file-per-spot map folders
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Spectrum:
+    """One spectrum that is not part of a map: a single-spot LabSpec export,
+    a LabSpec .h5 spectrum, or a spectrum taken out of a loaded map."""
+    wn: np.ndarray                 # ascending wavenumbers
+    inten: np.ndarray
+    label: str
+    path: str = ""
+    meta: dict = field(default_factory=dict)
+
+
+def is_single_spectrum(path: str) -> bool:
+    """True for a two-column (wavenumber, intensity) text export. A map's
+    first data row is the wavenumber axis and has far more than two fields,
+    so this never matches one."""
+    if path.lower().endswith(".h5"):
+        return True
+    try:
+        _, body = _read_lines(path)
+    except OSError:
+        return False
+    rows = body[:50]
+    return len(body) > 10 and all(
+        len([t for t in _split(r) if t.strip()]) == 2 for r in rows)
+
+
+def read_single_spectrum(path: str) -> Spectrum:
+    if path.lower().endswith(".h5"):
+        try:
+            import h5py
+        except ImportError:
+            raise ValueError("Reading .h5 files needs h5py:  pip install h5py")
+        with h5py.File(path, "r") as h:
+            if "Datas/Data1" not in h:
+                raise ValueError("No Datas/Data1 in this file; only LabSpec "
+                                 ".h5 exports are supported.")
+            ds = h["Datas/Data1"]
+            if ds.ndim != 1:
+                raise ValueError("This .h5 holds a %d-D dataset; only single "
+                                 "spectra are supported." % ds.ndim)
+            wn = np.asarray(ds.attrs["Axis1"], dtype=float)
+            inten = ds[:].astype(float)
+            meta = {}
+            if "Datas/DataInfo1" in h:
+                for r in h["Datas/DataInfo1"][:]:
+                    meta[r[0].decode(errors="replace")] = r[2].decode(errors="replace")
+    else:
+        header, body = _read_lines(path)
+        a = np.array([[_to_float(t) for t in _split(r) if t.strip()][:2]
+                      for r in body], dtype=float)
+        wn, inten = a[:, 0], a[:, 1]
+        meta = parse_header_meta(header)
+    o = np.argsort(wn)
+    return Spectrum(wn=wn[o], inten=inten[o], label=short_label(path),
+                    path=path, meta=meta)
+
+
+def short_label(path: str) -> str:
+    """A compact default label: the first three '_' parts of the file or
+    folder name, with the parent folder added when that is very short
+    (e.g. '007_01/5')."""
+    path = path.rstrip(os.sep)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    lab = "_".join(stem.split("_")[:3])[:28]
+    if len(lab) <= 4:
+        lab = os.path.basename(os.path.dirname(path)) + "/" + lab
+    return lab
+
+
+_SPOT_RE = re.compile(r"__X_([-+\d.]+)__Y_([-+\d.]+)__")
+
+
+def read_spot_folder(folder: str) -> MapFile:
+    """A map exported as one two-column file per spot, the stage position in
+    each filename (``..._<n>__X_<x>__Y_<y>__Time_<t>.txt``).
+
+    raw0 holds −X so that the instrument default (X = −col0, Y = col1)
+    places the spots exactly at their filename coordinates.
+    """
+    xs, ys, rows, axis = [], [], [], None
+    for name in sorted(os.listdir(folder)):
+        m = _SPOT_RE.search(name)
+        if not m or not name.lower().endswith((".txt", ".dat", ".csv")):
+            continue
+        a = np.loadtxt(os.path.join(folder, name), comments="#")
+        a = a[np.argsort(a[:, 0])]
+        if axis is None:
+            axis = a[:, 0]
+        elif a.shape[0] != axis.size or not np.allclose(a[:, 0], axis, atol=1e-3):
+            raise ValueError("%s has a different wavenumber axis from the "
+                             "other spots." % name)
+        xs.append(float(m.group(1)))
+        ys.append(float(m.group(2)))
+        rows.append(a[:, 1])
+    if not rows:
+        raise ValueError("No files named like ..._X_<x>__Y_<y>__... in this folder.")
+    x, y = np.array(xs), np.array(ys)
+    return MapFile(axis=axis, x=x, y=y, data=np.array(rows), path=folder,
+                   header=[], raw0=-x, raw1=y.copy(), layout="spectra")
+
+
+def band_height(wn: np.ndarray, D: np.ndarray, centre: float,
+                half: float) -> np.ndarray:
+    """Peak height above the flanking baseline, no fitting: the maximum
+    within ±half of centre minus the median of the flanks 2–4 half-widths
+    away. D is (n_spectra, n_axis)."""
+    pk = (wn > centre - half) & (wn < centre + half)
+    fl = (((wn > centre - 4 * half) & (wn < centre - 2 * half))
+          | ((wn > centre + 2 * half) & (wn < centre + 4 * half)))
+    if pk.sum() < 2 or fl.sum() < 4:
+        return np.full(D.shape[0], np.nan)
+    return np.nanmax(D[:, pk], axis=1) - np.nanmedian(D[:, fl], axis=1)
 
 
 def kmeans_1d(v: np.ndarray, k: int, iters: int = 200) -> np.ndarray:
@@ -1946,6 +2079,13 @@ class MapExplorerTab(QtWidgets.QWidget):
         bar.addWidget(QtWidgets.QLabel("Opacity"))
         bar.addWidget(self.sld_alpha)
         bar.addSpacing(12)
+        bar.addWidget(QtWidgets.QLabel("Map"))
+        self.cmb_quantity = QtWidgets.QComboBox()
+        self.cmb_quantity.addItems(["FWHM(2D)", "G height", "2D height"])
+        self.cmb_quantity.setToolTip("G / 2D height: raw peak height above the "
+                                     "flanking baseline, no fitting")
+        self.cmb_quantity.currentIndexChanged.connect(self.refresh_map)
+        bar.addWidget(self.cmb_quantity)
         bar.addWidget(QtWidgets.QLabel("Colour map"))
         bar.addWidget(self.cmb_cmap)
         bar.addStretch(1)
@@ -2229,16 +2369,31 @@ class MapExplorerTab(QtWidgets.QWidget):
         self.spec_canvas.draw()
 
     # -- drawing ------------------------------------------------------------
+    def height_grid(self, which: str) -> np.ndarray:
+        """Raw G or 2D peak height on the current grid (no fitting)."""
+        mf = self.main.mapfile
+        if which == "G height":
+            v = band_height(mf.axis, mf.data, 1582.0, 22.0)
+        else:
+            c = 0.5 * (self.main.cfg["band_min"] + self.main.cfg["band_max"])
+            v = band_height(mf.axis, mf.data, c, 45.0)
+        g = np.full(mf.shape, np.nan)
+        ok = mf.index_map >= 0
+        g[ok] = v[mf.index_map[ok]]
+        return g
+
     def refresh_map(self):
         mf = self.main.mapfile
-        if mf is None or self.main.fwhm_map is None:
+        quantity = self.cmb_quantity.currentText()
+        fwhm = quantity == "FWHM(2D)"
+        if mf is None or (fwhm and self.main.fwhm_map is None):
             self._show_placeholder()
             return
 
         cv = self.map_canvas
         cv.clear()
         ax = cv.ax
-        data = self.main.fwhm_map
+        data = self.main.fwhm_map if fwhm else self.height_grid(quantity)
         finite = np.isfinite(data)
         if finite.any():
             vmin = float(np.nanpercentile(data[finite], 2))
@@ -2253,9 +2408,9 @@ class MapExplorerTab(QtWidgets.QWidget):
                        vmin=vmin, vmax=vmax, interpolation="nearest",
                        aspect="equal", zorder=1)
         cb = side_colorbar(cv.figure, ax, im)
-        cb.set_label("FWHM(2D)  [cm$^{-1}$]")
+        cb.set_label("FWHM(2D)  [cm$^{-1}$]" if fwhm else "%s  [counts]" % quantity)
 
-        if not finite.any():
+        if fwhm and not finite.any():
             # An all-NaN map is otherwise indistinguishable from a map that
             # simply has not been fitted yet, so spell it out.
             tally = self.main.fit_tally or {}
@@ -2278,8 +2433,9 @@ class MapExplorerTab(QtWidgets.QWidget):
 
         ax.set_xlabel("X  [µm]")
         ax.set_ylabel("Y  [µm]")
-        ax.set_title("FWHM of the 2D band   (%d × %d pixels)"
-                     % (mf.shape[1], mf.shape[0]))
+        ax.set_title("%s   (%d × %d pixels)"
+                     % ("FWHM of the 2D band" if fwhm else quantity + " (raw)",
+                        mf.shape[1], mf.shape[0]))
         # An equal-aspect image in a wide canvas is anchored right by default
         # once the colorbar has taken its slice, stranding the map in the
         # corner with empty figure beside it.
@@ -4335,6 +4491,1010 @@ class SpectraTab(QtWidgets.QWidget):
         self.main.status("Saved %s and %s" % (os.path.basename(path), os.path.basename(fpath)))
 
 
+# ---------------------------------------------------------------------------
+# Tab 4 - Stacked spectra (publication figure, no fitting)
+# ---------------------------------------------------------------------------
+
+STACK_COLORS = ["#000000", "#e8402a", "#1f5fa8", "#2a8c4a", "#8a5a00",
+                "#7b3fa0", "#17becf", "#7f7f7f"]
+_NUM = r"(\d+(?:\.\d+)?)"
+
+
+def parse_windows(text: str) -> List[Tuple[float, float]]:
+    """'1450-1650, 2550-2800' -> [(1450, 1650), (2550, 2800)]."""
+    out = []
+    for lo, hi in re.findall(_NUM + r"\s*[-–:]\s*" + _NUM, text):
+        lo, hi = float(lo), float(hi)
+        if hi > lo:
+            out.append((lo, hi))
+    return out
+
+
+def parse_band_labels(text: str) -> List[Tuple[str, float]]:
+    """'G 1583, 2D 2690' -> [('G', 1583.0), ('2D', 2690.0)]."""
+    out = []
+    for piece in re.split(r"[,;]", text):
+        m = re.match(r"\s*(.+?)\s*@?\s*" + _NUM + r"\s*$", piece)
+        if m:
+            out.append((m.group(1), float(m.group(2))))
+    return out
+
+
+def _tick_step(span: float) -> float:
+    for s in (10, 25, 50, 100, 200, 500, 1000):
+        if span / s <= 3:
+            return s
+    return 1000.0
+
+
+def draw_stack(fig, traces: List[dict], windows: List[Tuple[float, float]],
+               step: float = 1.15, normalise: bool = True,
+               trace_labels: bool = False,
+               band_labels: List[Tuple[str, float]] = (), title: str = ""):
+    """Stacked spectra in one closed frame, the x axis broken between
+    spectral windows with // marks, no y ticks. Every window has the same
+    cm⁻¹ per centimetre. Raw data only: each trace is shifted by its 5th
+    percentile inside the windows and scaled to its maximum there (or, with
+    normalise off, all traces by one common factor)."""
+    fig.clear()
+    if not traces or not windows:
+        fig.text(0.5, 0.5, "No spectra" if windows else "No ranges",
+                 ha="center", va="center", color="#999", fontsize=8)
+        return
+    spans = [hi - lo for lo, hi in windows]
+    axs = np.atleast_1d(fig.subplots(
+        1, len(windows), sharey=True,
+        gridspec_kw={"width_ratios": spans, "wspace": 0.04}))
+
+    def in_windows(wn):
+        m = np.zeros(wn.shape, bool)
+        for lo, hi in windows:
+            m |= (wn >= lo) & (wn <= hi)
+        return m
+
+    scale = []
+    for t in traces:
+        m = in_windows(t["wn"])
+        if m.sum() < 2:
+            scale.append(None)
+            continue
+        base = float(np.nanpercentile(t["inten"][m], 5))
+        scale.append((base, float(np.nanmax(t["inten"][m])) - base))
+    common = max([s[1] for s in scale if s] or [1.0]) or 1.0
+
+    n = len(traces)
+    lo0, hi0 = windows[0]
+    for i, (t, sc) in enumerate(zip(traces, scale)):
+        if sc is None:
+            continue
+        off = (n - 1 - i) * step               # first trace at the top
+        y = (t["inten"] - sc[0]) / ((sc[1] or 1.0) if normalise else common) + off
+        for ax, (lo, hi) in zip(axs, windows):
+            s = (t["wn"] >= lo) & (t["wn"] <= hi)
+            ax.plot(t["wn"][s], y[s], color=t["color"], lw=0.6)
+        if trace_labels:
+            left = (t["wn"] >= lo0) & (t["wn"] <= lo0 + 0.3 * (hi0 - lo0))
+            ly = float(np.nanmax(y[left])) + 0.06 if left.any() else off + 0.25
+            axs[0].text(lo0 + 0.02 * (hi0 - lo0), ly, t["label"], color=t["color"],
+                        fontsize=6.5, style="italic", va="bottom")
+
+    top = (n - 1) * step + 1.06
+    ymax = top + (0.3 if band_labels else 0.08) + (0.32 if title else 0.0)
+    axs[0].set_ylim(-0.12, ymax)
+    for text, pos in band_labels:
+        for ax, (lo, hi) in zip(axs, windows):
+            if lo <= pos <= hi:
+                ax.text(pos, top, text, ha="center", va="bottom", fontsize=8)
+    if title:
+        axs[0].text(lo0 + 0.02 * (hi0 - lo0), ymax - 0.04, title, style="italic",
+                    fontsize=8, va="top")
+
+    for k, (ax, (lo, hi)) in enumerate(zip(axs, windows)):
+        ax.set_xlim(lo, hi)
+        st = _tick_step(hi - lo)
+        last = hi if k == len(windows) - 1 else hi - st / 4   # no label on a break
+        ax.set_xticks(np.arange(np.ceil(lo / st) * st, last + 1e-9, st))
+        ax.xaxis.set_minor_locator(matplotlib.ticker.MultipleLocator(st / 2))
+        ax.tick_params(axis="x", direction="out", labelsize=7, width=0.6,
+                       length=3, top=False)
+        ax.tick_params(axis="x", which="minor", direction="out", width=0.5,
+                       length=1.6, top=False)
+        ax.tick_params(axis="y", left=False, labelleft=False)
+        for sp in ax.spines.values():
+            sp.set_linewidth(0.6)
+        if k > 0:
+            ax.spines["left"].set_visible(False)
+        if k < len(windows) - 1:
+            ax.spines["right"].set_visible(False)
+    for a, b in zip(axs[:-1], axs[1:]):                # // marks on each break
+        for ax, xb in ((a, 1), (b, 0)):
+            ax.plot([xb, xb], [0, 1], transform=ax.transAxes, ls="none",
+                    marker=[(-1, -1.6), (1, 1.6)], markersize=5,
+                    markeredgewidth=0.6, color="k", clip_on=False)
+    axs[0].set_ylabel("Intensity (arb. u.)", fontsize=8)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.98, bottom=0.12)
+    # One x label centred under all windows: an empty frameless axes over
+    # the same area carries it, so it sits just below the tick labels.
+    l = axs[0].get_position().x0
+    r = axs[-1].get_position().x1
+    b, t = axs[0].get_position().y0, axs[0].get_position().y1
+    big = fig.add_axes([l, b, r - l, t - b], frameon=False, zorder=-1)
+    big.set_xticks([])
+    big.set_yticks([])
+    big.set_xlabel("Raman shift (cm$^{-1}$)", fontsize=8, labelpad=13)
+
+
+class StackTab(QtWidgets.QWidget):
+    """Stack spectra from files or from the loaded map into one figure and
+    export it. Nothing here fits anything."""
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.main = main
+        self.items: List[dict] = []          # {spec, color, visible}
+        self._build()
+
+    # -- UI -----------------------------------------------------------------
+    def _build(self):
+        root = QtWidgets.QHBoxLayout(self)
+        left = QtWidgets.QVBoxLayout()
+
+        self.tbl = QtWidgets.QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["Label", "", "Source"])
+        self.tbl.verticalHeader().setVisible(False)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        self.tbl.setColumnWidth(1, 26)
+        self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.tbl.itemChanged.connect(self._item_changed)
+        self.tbl.cellClicked.connect(self._cell_clicked)
+        left.addWidget(self.tbl, 1)
+
+        r = QtWidgets.QHBoxLayout()
+        for text, fn in (("Add files…", self.add_files),
+                         ("Add selected pixel", self.add_map_pixel),
+                         ("Add map median", self.add_map_median)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            r.addWidget(b)
+        left.addLayout(r)
+        r = QtWidgets.QHBoxLayout()
+        for text, fn in (("Up", lambda: self._move(-1)), ("Down", lambda: self._move(1)),
+                         ("Remove", self._remove), ("Clear", self.clear)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            r.addWidget(b)
+        left.addLayout(r)
+
+        form = QtWidgets.QFormLayout()
+        self.ed_win = QtWidgets.QLineEdit("1450-1650, 2550-2800")
+        form.addRow("Ranges (cm⁻¹)", self.ed_win)
+        self.spn_step = QtWidgets.QDoubleSpinBox()
+        self.spn_step.setRange(0.0, 5.0)
+        self.spn_step.setSingleStep(0.05)
+        self.spn_step.setValue(1.15)
+        form.addRow("Offset", self.spn_step)
+        self.chk_norm = QtWidgets.QCheckBox("Normalise each spectrum")
+        self.chk_norm.setChecked(True)
+        form.addRow(self.chk_norm)
+        self.chk_labels = QtWidgets.QCheckBox("Spectrum labels")
+        form.addRow(self.chk_labels)
+        self.chk_bands = QtWidgets.QCheckBox("Peak labels")
+        self.ed_bands = QtWidgets.QLineEdit("G 1583, 2D 2690")
+        rb = QtWidgets.QHBoxLayout()
+        rb.addWidget(self.chk_bands)
+        rb.addWidget(self.ed_bands, 1)
+        form.addRow(rb)
+        self.ed_title = QtWidgets.QLineEdit("")
+        form.addRow("Title", self.ed_title)
+        self.spn_w = QtWidgets.QDoubleSpinBox()
+        self.spn_w.setRange(3.0, 30.0)
+        self.spn_w.setValue(8.7)
+        self.spn_w.setSuffix(" cm")
+        self.spn_h = QtWidgets.QDoubleSpinBox()
+        self.spn_h.setRange(0.0, 30.0)
+        self.spn_h.setSpecialValueText("auto")
+        self.spn_h.setSuffix(" cm")
+        rs = QtWidgets.QHBoxLayout()
+        rs.addWidget(self.spn_w)
+        rs.addWidget(QtWidgets.QLabel("×"))
+        rs.addWidget(self.spn_h)
+        form.addRow("Size", rs)
+        left.addLayout(form)
+        b = QtWidgets.QPushButton("Export PDF…")
+        b.clicked.connect(self.export_pdf)
+        left.addWidget(b)
+
+        for w in (self.ed_win, self.ed_bands, self.ed_title):
+            w.editingFinished.connect(self.redraw)
+        for w in (self.spn_step, self.spn_w, self.spn_h):
+            w.valueChanged.connect(self.redraw)
+        for w in (self.chk_norm, self.chk_labels, self.chk_bands):
+            w.toggled.connect(self.redraw)
+
+        lw = QtWidgets.QWidget()
+        lw.setLayout(left)
+        lw.setMaximumWidth(430)
+        root.addWidget(lw)
+        self.preview = QtWidgets.QLabel()
+        self.preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview.setStyleSheet("background:white;")
+        sc = QtWidgets.QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setWidget(self.preview)
+        root.addWidget(sc, 1)
+        self.redraw()
+
+    # -- items ----------------------------------------------------------------
+    def add_spectrum(self, spec: Spectrum):
+        used = {it["color"] for it in self.items}
+        color = next((c for c in STACK_COLORS if c not in used), STACK_COLORS[0])
+        self.items.append({"spec": spec, "color": color, "visible": True})
+        self._rebuild()
+        self.redraw()
+
+    def add_paths(self, paths: List[str]):
+        bad = []
+        for p in paths:
+            try:
+                if os.path.isdir(p):
+                    mf = read_spot_folder(p)
+                    self.add_spectrum(Spectrum(
+                        mf.axis, np.nanmedian(mf.data, 0),
+                        short_label(p) + " median", p))
+                elif is_single_spectrum(p):
+                    self.add_spectrum(read_single_spectrum(p))
+                else:
+                    mf = parse_map_file(p)
+                    if mf.layout != "spectra":
+                        raise ValueError("not a spectrum")
+                    self.add_spectrum(Spectrum(
+                        mf.axis, np.nanmedian(mf.data, 0),
+                        short_label(p) + " median", p))
+            except Exception as exc:
+                bad.append("%s: %s" % (os.path.basename(p), exc))
+        if bad:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Could not read:\n\n"
+                                          + "\n".join(bad))
+
+    def add_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add spectra", "",
+            "Spectra (*.txt *.dat *.csv *.h5);;All files (*)")
+        if paths:
+            self.add_paths(paths)
+            self.main.tabs.setCurrentWidget(self)
+
+    def add_map_pixel(self):
+        mf, sel = self.main.mapfile, self.main.tab_map.sel
+        if mf is None or sel is None or mf.index_map[sel] < 0:
+            self.main.status("Click a pixel in the Map Explorer first.")
+            return
+        i = int(mf.index_map[sel])
+        name = short_label(mf.path)
+        self.add_spectrum(Spectrum(mf.axis, mf.data[i].astype(float),
+                                   "%s (%.1f, %.1f)" % (name, mf.x[i], mf.y[i]),
+                                   mf.path))
+
+    def add_map_median(self):
+        mf = self.main.mapfile
+        if mf is None:
+            self.main.status("Load a map first.")
+            return
+        name = short_label(mf.path)
+        self.add_spectrum(Spectrum(mf.axis, np.nanmedian(mf.data, 0),
+                                   "%s median" % name, mf.path))
+
+    def clear(self):
+        self.items = []
+        self._rebuild()
+        self.redraw()
+
+    def _remove(self):
+        rows = sorted({i.row() for i in self.tbl.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.items.pop(r)
+        self._rebuild()
+        self.redraw()
+
+    def _move(self, d: int):
+        rows = sorted({i.row() for i in self.tbl.selectedIndexes()})
+        if len(rows) != 1:
+            return
+        r, t = rows[0], rows[0] + d
+        if 0 <= t < len(self.items):
+            self.items[r], self.items[t] = self.items[t], self.items[r]
+            self._rebuild()
+            self.tbl.selectRow(t)
+            self.redraw()
+
+    def _rebuild(self):
+        self.tbl.blockSignals(True)
+        self.tbl.setRowCount(len(self.items))
+        for r, it in enumerate(self.items):
+            a = QtWidgets.QTableWidgetItem(it["spec"].label)
+            a.setFlags(a.flags() | QtCore.Qt.ItemIsUserCheckable)
+            a.setCheckState(QtCore.Qt.Checked if it["visible"] else QtCore.Qt.Unchecked)
+            self.tbl.setItem(r, 0, a)
+            c = QtWidgets.QTableWidgetItem("")
+            c.setFlags(QtCore.Qt.ItemIsEnabled)
+            c.setBackground(QtGui.QColor(it["color"]))
+            self.tbl.setItem(r, 1, c)
+            s = QtWidgets.QTableWidgetItem(os.path.basename(it["spec"].path.rstrip(os.sep)))
+            s.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            s.setToolTip(it["spec"].path)
+            self.tbl.setItem(r, 2, s)
+        self.tbl.blockSignals(False)
+
+    def _item_changed(self, item):
+        r = item.row()
+        if item.column() == 0 and 0 <= r < len(self.items):
+            self.items[r]["spec"].label = item.text()
+            self.items[r]["visible"] = item.checkState() == QtCore.Qt.Checked
+            self.redraw()
+
+    def _cell_clicked(self, r: int, c: int):
+        if c != 1 or not (0 <= r < len(self.items)):
+            return
+        col = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.items[r]["color"]), self)
+        if col.isValid():
+            self.items[r]["color"] = col.name()
+            self._rebuild()
+            self.redraw()
+
+    # -- figure ---------------------------------------------------------------
+    def _figure(self) -> Figure:
+        traces = [{"wn": it["spec"].wn, "inten": it["spec"].inten,
+                   "label": it["spec"].label, "color": it["color"]}
+                  for it in self.items if it["visible"]]
+        w = self.spn_w.value() / 2.54
+        h = self.spn_h.value() / 2.54 or (2.6 + 1.25 * max(1, len(traces))) / 2.54
+        fig = Figure(figsize=(w, h))
+        FigureCanvasAgg(fig)
+        draw_stack(fig, traces, parse_windows(self.ed_win.text()),
+                   step=self.spn_step.value(), normalise=self.chk_norm.isChecked(),
+                   trace_labels=self.chk_labels.isChecked(),
+                   band_labels=parse_band_labels(self.ed_bands.text())
+                   if self.chk_bands.isChecked() else [],
+                   title=self.ed_title.text().strip())
+        return fig
+
+    def redraw(self):
+        import io
+        fig = self._figure()
+        buf = io.BytesIO()
+        ratio = self.devicePixelRatioF() if hasattr(self, "devicePixelRatioF") else 1.0
+        fig.savefig(buf, format="png", dpi=150 * ratio, bbox_inches="tight",
+                    pad_inches=0.03, facecolor="white")
+        pm = QtGui.QPixmap()
+        pm.loadFromData(buf.getvalue())
+        pm.setDevicePixelRatio(ratio)
+        self.preview.setPixmap(pm)
+
+    def export_pdf(self):
+        stem = "stacked_spectra.pdf"
+        vis = [it for it in self.items if it["visible"]]
+        if vis and vis[0]["spec"].path:
+            stem = os.path.join(os.path.dirname(vis[0]["spec"].path.rstrip(os.sep)), stem)
+        start = os.path.join(_EXPORT_DIR["path"], os.path.basename(stem)) \
+            if _EXPORT_DIR["path"] else stem
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export PDF", start, "Vector PDF (*.pdf)")
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        _EXPORT_DIR["path"] = os.path.dirname(path)
+        self._figure().savefig(path, bbox_inches="tight", pad_inches=0.03,
+                               facecolor="white")
+        self.main.status("Exported %s" % path)
+
+
+# ---------------------------------------------------------------------------
+# Tab 5 - Layer prediction against 1L / 2L reference datasets
+# ---------------------------------------------------------------------------
+
+REF_ROWS = [("2D_fwhm", "2D FWHM (cm⁻¹)"), ("I2D_IG", "I(2D)/I(G)"),
+            ("A2D_AG", "A(2D)/A(G)"), ("2D_pos", "2D position (cm⁻¹)"),
+            ("2D_height", "2D intensity"), ("G_pos", "G position (cm⁻¹)"),
+            ("G_fwhm", "G FWHM (cm⁻¹)"), ("G_height", "G intensity"),
+            ("Gminus_pos", "G⁻ position (cm⁻¹)"), ("Gplus_pos", "G⁺ position (cm⁻¹)")]
+
+
+class PredictTab(QtWidgets.QWidget):
+    """Reference values (Lorentzian fits of the 1L and 2L datasets, mean ±
+    SD) and layer-number / stacking predictions for new data."""
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.main = main
+        self.ref = None
+        self.preds: Optional[List[dict]] = None
+        self.pred_title = ""
+        self._build()
+        if HAVE_GREF and os.path.exists(gref.DEFAULT_REF):
+            self._set_ref(gref.load(gref.DEFAULT_REF), gref.DEFAULT_REF)
+
+    def _build(self):
+        root = QtWidgets.QHBoxLayout(self)
+        left = QtWidgets.QVBoxLayout()
+        r = QtWidgets.QHBoxLayout()
+        for text, fn in (("Build reference…", self.build_ref),
+                         ("Load reference…", self.load_ref)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            b.setEnabled(HAVE_GREF)
+            r.addWidget(b)
+        left.addLayout(r)
+        self.lbl_ref = QtWidgets.QLabel("No reference loaded")
+        self.lbl_ref.setWordWrap(True)
+        self.lbl_ref.setStyleSheet("color:#555; font-size:11px;")
+        left.addWidget(self.lbl_ref)
+        self.tbl_ref = QtWidgets.QTableWidget(0, 0)
+        self.tbl_ref.verticalHeader().setDefaultSectionSize(22)
+        self.tbl_ref.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        left.addWidget(self.tbl_ref, 2)
+        r = QtWidgets.QHBoxLayout()
+        self.btn_map = QtWidgets.QPushButton("Predict loaded map")
+        self.btn_map.clicked.connect(self.predict_map)
+        self.btn_dir = QtWidgets.QPushButton("Predict folder…")
+        self.btn_dir.clicked.connect(self.predict_dir)
+        for b in (self.btn_map, self.btn_dir):
+            b.setEnabled(False)
+            r.addWidget(b)
+        left.addLayout(r)
+        self.tbl_pred = QtWidgets.QTableWidget(0, 2)
+        self.tbl_pred.setHorizontalHeaderLabels(["Prediction", "Spectra"])
+        self.tbl_pred.verticalHeader().setVisible(False)
+        self.tbl_pred.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.tbl_pred.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        left.addWidget(self.tbl_pred, 1)
+        lw = QtWidgets.QWidget()
+        lw.setLayout(left)
+        lw.setMinimumWidth(600)
+        lw.setMaximumWidth(640)
+        root.addWidget(lw)
+        self.plot = Canvas(figsize=(8, 5))
+        root.addWidget(self.plot, 1)
+        self.redraw()
+
+    # -- reference --------------------------------------------------------------
+    def _set_ref(self, ref, path):
+        self.ref = ref
+        ds = ref["datasets"]
+        self.lbl_ref.setText("Reference %s (built %s). Predictions use the 'matching' "
+                             "spots: fitted 2D FWHM %s." % (
+                                 os.path.basename(path), ref.get("created", "?"),
+                                 ", ".join("%s %g–%g" % (k, *v)
+                                           for k, v in ref["match_rule"].items())))
+        cols = []
+        for d in ds:
+            for which in ("all", "matching"):
+                cols.append((d, which))
+        self.tbl_ref.clear()
+        self.tbl_ref.setColumnCount(len(cols))
+        self.tbl_ref.setRowCount(len(REF_ROWS) + 1)
+        self.tbl_ref.setHorizontalHeaderLabels(
+            ["%s %s\n%s" % (d["label"], d["name"].split("_")[0], w) for d, w in cols])
+        self.tbl_ref.setVerticalHeaderLabels(["spectra"] + [lab for _, lab in REF_ROWS])
+        for j, (d, w) in enumerate(cols):
+            n = d["n_fitted"] if w == "all" else d["n_matching"]
+            self.tbl_ref.setItem(0, j, QtWidgets.QTableWidgetItem("%d" % n))
+            for i, (q, _) in enumerate(REF_ROWS, start=1):
+                s = d[w].get(q, {})
+                txt = "" if s.get("mean") is None else (
+                    "%.4g ± %.2g" % (s["mean"], s["std"] or 0))
+                self.tbl_ref.setItem(i, j, QtWidgets.QTableWidgetItem(txt))
+        self.tbl_ref.resizeColumnsToContents()
+        for b in (self.btn_map, self.btn_dir):
+            b.setEnabled(True)
+        self.redraw()
+
+    def build_ref(self):
+        f1 = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "1L reference dataset (folder of spectra, e.g. the ML map)")
+        if not f1:
+            return
+        f2 = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "2L reference dataset (folder of spectra, e.g. the BL map)")
+        if not f2:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            ref = gref.build([("1L", f1), ("2L", f2)], gref.DEFAULT_REF)
+        except Exception as exc:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Could not build:\n\n%s" % exc)
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self._set_ref(ref, gref.DEFAULT_REF)
+        self.main.status("Reference saved to %s" % os.path.dirname(gref.DEFAULT_REF))
+
+    def load_ref(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load reference", os.path.dirname(gref.DEFAULT_REF), "JSON (*.json)")
+        if path:
+            self._set_ref(gref.load(path), path)
+
+    # -- prediction -------------------------------------------------------------
+    def predict_map(self):
+        mf = self.main.mapfile
+        if mf is None:
+            self.main.status("Load a map first.")
+            return
+        prog = QtWidgets.QProgressDialog("Fitting G and 2D…", "Cancel", 0, mf.n_points, self)
+        prog.setWindowModality(QtCore.Qt.WindowModal)
+        rows = []
+        for i in range(mf.n_points):
+            if prog.wasCanceled():
+                return
+            prog.setValue(i)
+            r, _, _ = rpf.analyse_spectrum(mf.axis, mf.data[i].astype(float))
+            r.update(file="spot %d" % i, x=float(mf.x[i]), y=float(mf.y[i]), idx=i)
+            rows.append(r)
+        prog.setValue(mf.n_points)
+        p = mf.path.rstrip(os.sep)
+        out = os.path.join(p, "output") if os.path.isdir(p) else \
+            os.path.splitext(p)[0] + "_output"
+        self._show(gref.write_predictions(rows, self.ref, out, short_label(p)),
+                   short_label(p), out)
+
+    def predict_dir(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Dataset to predict")
+        if not folder:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            preds = gref.predict_folder(folder, self.ref)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._show(preds, short_label(folder), os.path.join(folder, "output"))
+
+    def _show(self, preds, title, out):
+        self.preds, self.pred_title = preds, title
+        counts: Dict[str, int] = {}
+        for p in preds:
+            key = p["layer"] + ("  " + p["polytype"] if p["polytype"] not in ("", "—") else "")
+            counts[key] = counts.get(key, 0) + 1
+        self.tbl_pred.setRowCount(len(counts))
+        for i, (k, n) in enumerate(sorted(counts.items(), key=lambda kv: -kv[1])):
+            self.tbl_pred.setItem(i, 0, QtWidgets.QTableWidgetItem(k))
+            self.tbl_pred.setItem(i, 1, QtWidgets.QTableWidgetItem("%d" % n))
+        self.redraw()
+        self.main.status("Predictions saved to %s" % os.path.join(out, "predictions.csv"))
+
+    # -- figure -----------------------------------------------------------------
+    def redraw(self):
+        fig = self.plot.figure
+        fig.clear()
+        if not HAVE_GREF or self.ref is None:
+            fig.text(0.5, 0.5, "No reference" if HAVE_GREF else
+                     "raman_peak_fit.py / graphene_reference.py not found",
+                     ha="center", va="center", color="#999")
+            self.plot.draw()
+            return
+        preds = self.preds or []
+        has_xy = sum(np.isfinite(p["x"]) for p in preds) > 3
+        axs = np.atleast_1d(fig.subplots(1, 2 if has_xy else 1))
+        ax = axs[0]
+        gref.draw_reference(ax, self.ref, matching_only=not preds)
+        for lab, c in gref.COLORS.items():
+            if lab == "no fit":                 # failed fits carry no usable values
+                continue
+            sel = [p for p in preds if p["layer"] == lab and np.isfinite(p["2D_fwhm"])]
+            if sel:
+                ax.scatter([p["2D_fwhm"] for p in sel], [p["I2D_IG"] for p in sel], s=18,
+                           marker="x", lw=0.8, color="k" if lab in ("1L", "2L") else c,
+                           label="%s: %s (%d)" % (self.pred_title, lab, len(sel)))
+        ax.legend(fontsize=7, frameon=False)
+        if has_xy:
+            ax = axs[1]
+            for lab, c in gref.COLORS.items():
+                sel = [p for p in preds if p["layer"] == lab]
+                if sel:
+                    ax.scatter([p["x"] for p in sel], [p["y"] for p in sel], s=40,
+                               marker="s", color=c, lw=0, label="%s (%d)" % (lab, len(sel)))
+            ax.set_aspect("equal")
+            ax.set_xlabel("X  [µm]")
+            ax.set_ylabel("Y  [µm]")
+            ax.set_title(self.pred_title, fontsize=9)
+            ax.legend(fontsize=7, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+            orient_axes(ax, self.main.cfg)
+        self.plot.draw()
+
+
+# ---------------------------------------------------------------------------
+# Tab 6 - Peak fitting: Si calibration, background, Lorentzians, peak count
+# ---------------------------------------------------------------------------
+
+BAND_DEFAULTS = [("G", 1500.0, 1680.0, "Auto", 3), ("2D", 2560.0, 2810.0, "Auto", 4)]
+COMP_COLORS = ["#1f5fa8", "#e8402a", "#2a8c4a", "#8a5a00", "#7b3fa0", "#17becf"]
+
+
+class PeakFitTab(QtWidgets.QWidget):
+    """Fit any spectra band by band: optional Si calibration, a background
+    model, and Lorentzians with the number of peaks set by hand or chosen
+    from the data. Batch over files, folders or the loaded map."""
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.main = main
+        self.items: List[dict] = []      # {label, wn, y, path, x, ypos}
+        self.results: Dict[int, dict] = {}
+        self._build()
+
+    # -- UI -------------------------------------------------------------------
+    def _build(self):
+        root = QtWidgets.QHBoxLayout(self)
+        left = QtWidgets.QVBoxLayout()
+
+        self.lst = QtWidgets.QListWidget()
+        self.lst.currentRowChanged.connect(self._selected)
+        left.addWidget(self.lst, 2)
+        r = QtWidgets.QHBoxLayout()
+        for text, fn in (("Add files…", self.add_files), ("Add folder…", self.add_folder),
+                         ("Use loaded map", self.use_map), ("Clear", self.clear)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            r.addWidget(b)
+        left.addLayout(r)
+
+        form = QtWidgets.QFormLayout()
+        self.chk_si = QtWidgets.QCheckBox("Calibrate on Si (520.7 cm⁻¹)")
+        self.chk_si.setChecked(True)
+        form.addRow(self.chk_si)
+        self.cmb_bg = QtWidgets.QComboBox()
+        self.cmb_bg.addItems(["linear", "polynomial", "als", "none"])
+        form.addRow("Background", self.cmb_bg)
+        rb = QtWidgets.QHBoxLayout()
+        self.spn_order = QtWidgets.QSpinBox()
+        self.spn_order.setRange(1, 8)
+        self.spn_order.setValue(3)
+        self.ed_lam = QtWidgets.QLineEdit("1e5")
+        self.ed_p = QtWidgets.QLineEdit("0.01")
+        for lab, w in (("order", self.spn_order), ("λ", self.ed_lam), ("p", self.ed_p)):
+            rb.addWidget(QtWidgets.QLabel(lab))
+            rb.addWidget(w)
+        form.addRow(rb)
+        left.addLayout(form)
+
+        self.tbl_bands = QtWidgets.QTableWidget(0, 5)
+        self.tbl_bands.setHorizontalHeaderLabels(["Band", "From", "To", "Peaks", "Max"])
+        self.tbl_bands.verticalHeader().setVisible(False)
+        self.tbl_bands.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.tbl_bands.setMaximumHeight(140)
+        for band in BAND_DEFAULTS:
+            self._add_band_row(*band)
+        left.addWidget(self.tbl_bands)
+        r = QtWidgets.QHBoxLayout()
+        for text, fn in (("Add band", lambda: self._add_band_row("band", 1000, 1100, "Auto", 3)),
+                         ("Remove band", self._remove_band)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            r.addWidget(b)
+        left.addLayout(r)
+
+        r = QtWidgets.QHBoxLayout()
+        for text, fn in (("Fit selected", self.fit_selected), ("Fit all…", self.fit_all),
+                         ("ω_G–ω_2D plot…", self.correlation)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            b.setEnabled(HAVE_GREF)
+            r.addWidget(b)
+        left.addLayout(r)
+
+        self.tbl_peaks = QtWidgets.QTableWidget(0, 6)
+        self.tbl_peaks.setHorizontalHeaderLabels(["Band", "#", "Centre", "FWHM", "Height", "Area"])
+        self.tbl_peaks.verticalHeader().setVisible(False)
+        self.tbl_peaks.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.tbl_peaks.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        left.addWidget(self.tbl_peaks, 2)
+        self.lbl = QtWidgets.QLabel("")
+        self.lbl.setWordWrap(True)
+        self.lbl.setStyleSheet("color:#555; font-size:11px;")
+        left.addWidget(self.lbl)
+
+        lw = QtWidgets.QWidget()
+        lw.setLayout(left)
+        lw.setMaximumWidth(500)
+        root.addWidget(lw)
+        self.plot = Canvas(figsize=(8, 5))
+        root.addWidget(self.plot, 1)
+        self._placeholder()
+
+    def _add_band_row(self, name, lo, hi, peaks, nmax):
+        r = self.tbl_bands.rowCount()
+        self.tbl_bands.insertRow(r)
+        self.tbl_bands.setItem(r, 0, QtWidgets.QTableWidgetItem(name))
+        self.tbl_bands.setItem(r, 1, QtWidgets.QTableWidgetItem("%g" % lo))
+        self.tbl_bands.setItem(r, 2, QtWidgets.QTableWidgetItem("%g" % hi))
+        cmb = QtWidgets.QComboBox()
+        cmb.addItems(["Auto"] + [str(k) for k in range(1, 7)])
+        cmb.setCurrentText(str(peaks))
+        self.tbl_bands.setCellWidget(r, 3, cmb)
+        sp = QtWidgets.QSpinBox()
+        sp.setRange(1, 6)
+        sp.setValue(int(nmax))
+        self.tbl_bands.setCellWidget(r, 4, sp)
+
+    def _remove_band(self):
+        r = self.tbl_bands.currentRow()
+        if r >= 0:
+            self.tbl_bands.removeRow(r)
+
+    def bands(self) -> List[tuple]:
+        out = []
+        for r in range(self.tbl_bands.rowCount()):
+            try:
+                lo = float(self.tbl_bands.item(r, 1).text())
+                hi = float(self.tbl_bands.item(r, 2).text())
+            except (AttributeError, ValueError):
+                continue
+            n = self.tbl_bands.cellWidget(r, 3).currentText()
+            out.append((self.tbl_bands.item(r, 0).text(), lo, hi,
+                        "auto" if n == "Auto" else int(n),
+                        self.tbl_bands.cellWidget(r, 4).value()))
+        return out
+
+    def bg_opts(self) -> dict:
+        try:
+            return {"order": self.spn_order.value(), "lam": float(self.ed_lam.text()),
+                    "p": float(self.ed_p.text())}
+        except ValueError:
+            return {"order": self.spn_order.value()}
+
+    # -- spectra --------------------------------------------------------------
+    def _add(self, label, wn, y, path, x=np.nan, ypos=np.nan):
+        self.items.append({"label": label, "wn": np.asarray(wn, float),
+                           "y": np.asarray(y, float), "path": path, "x": x, "ypos": ypos})
+        self.lst.addItem(label)
+
+    def add_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add spectra", "", "Spectra (*.txt *.dat *.csv *.h5);;All files (*)")
+        for p in paths:
+            try:
+                s = read_single_spectrum(p)
+                self._add(s.label, s.wn, s.inten, p)
+            except Exception as exc:
+                self.main.status("Skipped %s: %s" % (os.path.basename(p), exc))
+        if self.items and self.lst.currentRow() < 0:
+            self.lst.setCurrentRow(0)
+
+    def add_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder of spectra")
+        if not folder:
+            return
+        for name in sorted(os.listdir(folder)):
+            p = os.path.join(folder, name)
+            if not name.lower().endswith((".txt", ".dat", ".csv")) or not is_single_spectrum(p):
+                continue
+            s = read_single_spectrum(p)
+            m = _SPOT_RE.search(name)
+            self._add(short_label(p), s.wn, s.inten, p,
+                      float(m.group(1)) if m else np.nan, float(m.group(2)) if m else np.nan)
+        if self.items and self.lst.currentRow() < 0:
+            self.lst.setCurrentRow(0)
+
+    def use_map(self):
+        mf = self.main.mapfile
+        if mf is None:
+            self.main.status("Load a map first.")
+            return
+        for i in range(mf.n_points):
+            self._add("spot %d (%.1f, %.1f)" % (i, mf.x[i], mf.y[i]), mf.axis, mf.data[i],
+                      mf.path, float(mf.x[i]), float(mf.y[i]))
+        if self.lst.currentRow() < 0:
+            self.lst.setCurrentRow(0)
+
+    def clear(self):
+        self.items, self.results = [], {}
+        self.lst.clear()
+        self.tbl_peaks.setRowCount(0)
+        self._placeholder()
+
+    # -- fitting --------------------------------------------------------------
+    def fit_item(self, i: int) -> dict:
+        it = self.items[i]
+        wn, y = it["wn"], it["y"]
+        shift, si = rt.si_shift(wn, y) if self.chk_si.isChecked() else (0.0, None)
+        w = wn + shift
+        nz = rt.noise_level(w, y)
+        res = {"shift": shift, "si": si, "noise": nz, "bands": {}}
+        for name, lo, hi, n, nmax in self.bands():
+            res["bands"][name] = rt.analyse_band(w, y, lo, hi, n=n, nmax=nmax,
+                                                 bg=self.cmb_bg.currentText(),
+                                                 bg_opts=self.bg_opts(), noise=nz)
+        self.results[i] = res
+        return res
+
+    def _selected(self, i: int):
+        if 0 <= i < len(self.items):
+            self.fit_selected()
+
+    def fit_selected(self):
+        i = self.lst.currentRow()
+        if not (0 <= i < len(self.items)):
+            return
+        self.draw_fit(i, self.fit_item(i))
+
+    def fit_all(self):
+        if not self.items:
+            return
+        prog = QtWidgets.QProgressDialog("Fitting…", "Cancel", 0, len(self.items), self)
+        prog.setWindowModality(QtCore.Qt.WindowModal)
+        for i in range(len(self.items)):
+            if prog.wasCanceled():
+                return
+            prog.setValue(i)
+            self.fit_item(i)
+        prog.setValue(len(self.items))
+        src = self.items[0]["path"].rstrip(os.sep)
+        base = src if os.path.isdir(src) else os.path.dirname(src)
+        out = os.path.join(base, "output")
+        os.makedirs(out, exist_ok=True)
+        path = os.path.join(out, "peak_fits.csv")
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["spectrum", "x", "y", "si_shift", "band", "n_peaks", "peak",
+                        "centre", "centre_err", "fwhm", "fwhm_err", "height", "height_err",
+                        "area", "area_err", "r2", "note"])
+            for i, it in enumerate(self.items):
+                res = self.results[i]
+                for name, b in res["bands"].items():
+                    rows = b.get("comps") or [None]
+                    for k, c in enumerate(rows):
+                        w.writerow([it["label"], _fmt(it["x"]), _fmt(it["ypos"]),
+                                    _fmt(res["shift"]), name, b.get("n", 0), k + 1 if c else ""]
+                                   + (["%.3f" % c[q] for q in ("pos", "pos_err", "fwhm", "fwhm_err",
+                                                                "height", "height_err", "area",
+                                                                "area_err")] if c else [""] * 8)
+                                   + [_fmt(b.get("r2", np.nan)),
+                                      b.get("why") or b.get("stopped", "")])
+        self.draw_summary()
+        self.main.status("Fitted %d spectra — saved %s" % (len(self.items), path))
+
+    # -- drawing --------------------------------------------------------------
+    def _placeholder(self):
+        self.plot.figure.clear()
+        self.plot.figure.text(0.5, 0.5, "Add spectra", ha="center", va="center", color="#999")
+        self.plot.draw()
+
+    def draw_fit(self, i: int, res: dict):
+        fig = self.plot.figure
+        fig.clear()
+        bands = [(n, b) for n, b in res["bands"].items()]
+        if not bands:
+            self._placeholder()
+            return
+        gs = fig.add_gridspec(2, len(bands), height_ratios=[3, 1], hspace=0.05)
+        self.tbl_peaks.setRowCount(0)
+        for j, (name, b) in enumerate(bands):
+            ax = fig.add_subplot(gs[0, j])
+            axr = fig.add_subplot(gs[1, j], sharex=ax)
+            if "x" not in b:
+                ax.text(0.5, 0.5, "%s: %s" % (name, b.get("why", "")), transform=ax.transAxes,
+                        ha="center", color="#999")
+                continue
+            x, raw, bg = b["x"], b["raw"], b["bg"]
+            ax.plot(x, raw, color="#999", lw=0.7, label="data")
+            ax.plot(x, bg, color="k", lw=0.6, ls="--", label="background")
+            if b.get("ok"):
+                base = bg + b["baseline"]
+                ax.plot(x, base + b["curve"][2] - b["baseline"], color="#d81b60", lw=1.0,
+                        label="fit")
+                for k, comp in enumerate(b["components"]):
+                    ax.plot(x, base + comp, color=COMP_COLORS[k % 6], lw=0.7)
+                axr.plot(x, (b["curve"][1] - b["curve"][2]) / (b.get("noise") or 1),
+                         color="#555", lw=0.6)
+                for k, c in enumerate(b["comps"]):
+                    r = self.tbl_peaks.rowCount()
+                    self.tbl_peaks.insertRow(r)
+                    for col, txt in enumerate([name, str(k + 1),
+                                               "%.2f ± %.2f" % (c["pos"], c["pos_err"]),
+                                               "%.2f ± %.2f" % (c["fwhm"], c["fwhm_err"]),
+                                               "%.0f ± %.0f" % (c["height"], c["height_err"]),
+                                               "%.0f" % c["area"]]):
+                        self.tbl_peaks.setItem(r, col, QtWidgets.QTableWidgetItem(txt))
+            ax.set_title("%s: %d peak%s%s" % (name, b.get("n", 0), "" if b.get("n") == 1 else "s",
+                                              "" if b.get("ok") else " (failed)"), fontsize=9)
+            ax.tick_params(labelbottom=False, labelsize=7)
+            ax.set_yticks([])
+            axr.axhline(0, color="k", lw=0.4)
+            axr.set_xlabel("Raman shift (cm$^{-1}$)", fontsize=8)
+            axr.tick_params(labelsize=7)
+            if j == 0:
+                axr.set_ylabel("resid./σ", fontsize=7)
+                ax.legend(fontsize=7, frameon=False)
+        notes = ["Si shift %+.2f cm⁻¹" % res["shift"] if self.chk_si.isChecked() else "no Si calibration",
+                 "noise %.1f counts" % res["noise"]]
+        for name, b in bands:
+            if b.get("stopped"):
+                notes.append("%s: stopped at %d — %s" % (name, b.get("n", 0), b["stopped"]))
+        self.lbl.setText(";  ".join(notes))
+        self.plot.draw()
+
+    def draw_summary(self):
+        """Peak count per band: a map when the spectra have positions,
+        otherwise a histogram."""
+        fig = self.plot.figure
+        fig.clear()
+        names = [b[0] for b in self.bands()]
+        has_xy = sum(np.isfinite(it["x"]) for it in self.items) > 3
+        axs = np.atleast_1d(fig.subplots(1, len(names)))
+        for ax, name in zip(axs, names):
+            n = np.array([self.results[i]["bands"].get(name, {}).get("n", 0)
+                          if self.results[i]["bands"].get(name, {}).get("ok") else 0
+                          for i in range(len(self.items))])
+            if has_xy:
+                x = np.array([it["x"] for it in self.items])
+                y = np.array([it["ypos"] for it in self.items])
+                cmap = matplotlib.colors.ListedColormap(["#eeeeee"] + COMP_COLORS)
+                sc = ax.scatter(x, y, c=n, cmap=cmap, vmin=-0.5, vmax=6.5, s=40, marker="s", lw=0)
+                ax.set_aspect("equal")
+                orient_axes(ax, self.main.cfg)
+                cb = fig.colorbar(sc, ax=ax, ticks=range(0, 7), shrink=0.8)
+                cb.set_label("peaks (0 = no fit)", fontsize=7)
+            else:
+                ax.hist(n, bins=np.arange(-0.5, 7.5, 1), color="#777")
+                ax.set_xlabel("peaks")
+            ax.set_title("%s peak count" % name, fontsize=9)
+        self.plot.draw()
+
+    def correlation(self):
+        if not self.items:
+            return
+        ref = self.main.tab_pred.ref
+        if ref is None:
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Build or load a 1L/2L "
+                                              "reference in tab 5 first.")
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("ω_G – ω_2D correlation")
+        lay = QtWidgets.QHBoxLayout(dlg)
+        form = QtWidgets.QFormLayout()
+        eds = {}
+        for k, lab in (("G0", "ω_G0 (cm⁻¹)"), ("D0", "ω_2D0 (cm⁻¹)"),
+                       ("a_G", "∂ω_G/∂ε (cm⁻¹/%)"), ("s_strain", "strain slope"),
+                       ("b_G", "∂ω_G/∂n (cm⁻¹/10¹³)"), ("s_doping", "doping slope")):
+            eds[k] = QtWidgets.QLineEdit("%g" % sd.PARAMS[k])
+            form.addRow(lab, eds[k])
+        btn = QtWidgets.QPushButton("Redraw")
+        form.addRow(btn)
+        fw = QtWidgets.QWidget()
+        fw.setLayout(form)
+        lay.addWidget(fw)
+        cv = Canvas(figsize=(5, 5))
+        lay.addWidget(cv, 1)
+        prog = QtWidgets.QProgressDialog("Analysing…", "Cancel", 0, len(self.items), self)
+        prog.setWindowModality(QtCore.Qt.WindowModal)
+        def tick(k, n):
+            prog.setValue(k)
+            QtWidgets.QApplication.processEvents()
+            return not prog.wasCanceled()
+        rows = sd.analyse_many([(it["wn"], it["y"]) for it in self.items], ref,
+                               progress=tick)
+        prog.setValue(len(self.items))
+        if rows is None:
+            return
+
+        def redraw():
+            try:
+                p = {k: float(e.text()) for k, e in eds.items()}
+            except ValueError:
+                return
+            cv.figure.clear()
+            ax = cv.figure.add_subplot(111)
+            sd.draw_correlation(ax, rows, p)
+            cv.draw()
+        btn.clicked.connect(redraw)
+        redraw()
+        fit_to_screen(dlg, 1000, 700)
+        dlg.exec_()
+
+
 class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
@@ -4367,6 +5527,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.tab_class, "2 · Classification")
         self.tab_spec = SpectraTab(self)
         self.tabs.addTab(self.tab_spec, "3 · Spectra")
+        self.tab_stack = StackTab(self)
+        self.tabs.addTab(self.tab_stack, "4 · Stacked spectra")
+        self.tab_pred = PredictTab(self)
+        self.tabs.addTab(self.tab_pred, "5 · Layer prediction")
+        self.tab_fit = PeakFitTab(self)
+        self.tabs.addTab(self.tab_fit, "6 · Peak fitting")
         self.setCentralWidget(self.tabs)
 
         self.progress = QtWidgets.QProgressBar()
@@ -4381,7 +5547,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _menus(self):
         m = self.menuBar().addMenu("&File")
         m.addAction("Open Raman map…", self.load_raman, "Ctrl+O")
+        m.addAction("Open map folder…", self.load_folder)
         m.addAction("Open optical image…", self.load_optical)
+        m.addAction("Add spectra to stack…", self.tab_stack.add_files)
         m.addSeparator()
         m.addAction("Save settings…", self.save_config)
         m.addAction("Load settings…", self.load_config)
@@ -4407,13 +5575,27 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- loading ------------------------------------------------------------
     def load_raman(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open Raman map", "", "Text/map files (*.txt *.dat *.csv);;All files (*)")
+            self, "Open Raman map", "",
+            "Text/map files (*.txt *.dat *.csv *.h5);;All files (*)")
+        if path:
+            self.open_raman(path)
+
+    def load_folder(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Open map folder (one file per spot)")
         if path:
             self.open_raman(path)
 
     def open_raman(self, path: str):
+        # A single spectrum is not a map: it goes to the stack tab instead.
+        if not os.path.isdir(path) and is_single_spectrum(path):
+            self.tab_stack.add_paths([path])
+            self.tabs.setCurrentWidget(self.tab_stack)
+            self.status("%s is a single spectrum — added to the Stacked "
+                        "spectra tab." % os.path.basename(path))
+            return
         try:
-            mf = parse_map_file(path)
+            mf = read_spot_folder(path) if os.path.isdir(path) else parse_map_file(path)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, APP_NAME, "Could not parse the file:\n\n%s" % exc)
@@ -4861,7 +6043,7 @@ def main(argv=None):
     app.setApplicationName(APP_NAME)
     win = MainWindow()
     win.show()
-    if len(argv) > 1 and os.path.isfile(argv[1]):
+    if len(argv) > 1 and os.path.exists(argv[1]):
         QtCore.QTimer.singleShot(100, lambda: win.open_raman(argv[1]))
     return app.exec_()
 
