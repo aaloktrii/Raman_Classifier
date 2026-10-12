@@ -1,22 +1,22 @@
 # HANDOFF — Raman classifier: graphene 1L/2L on hBN / RuCl₃
 
-Last session: 2026-10-10. Owner: Aalok (CMU). Read this first in any new session, then open the GUI (§8).
+Last session: 2026-10-12. Owner: Aalok (CMU). Read this first in any new session, then open the GUI (§8).
 
 ---
 
 ## 1. Status in one paragraph
-The fork of the 2D Raman map classifier GUI now loads single spectra, LabSpec `.h5` files and one-file-per-spot map folders. It has three new tabs: stacked publication spectra (4), 1L/2L layer prediction against reference datasets (5), and Lorentzian peak fitting with Si calibration, background models, automatic or manual peak count and an ω_G–ω_2D strain/doping plot (6). The ML and BL RuCl₃ maps have been analysed. Both cover the same flake: a 1L strip on hBN, plus 2L that is partly on hBN and partly on RuCl₃, where G splits into G⁻/G⁺. The user's ω_G–ω_2D figure has been reproduced by layer and substrate. **Nothing is committed.** Everything is on branch `stacked-spectra-and-folder-maps`. Next steps: get the published strain/doping constants, commit and push, then decide on extending to more layers.
+The fork of the 2D Raman map classifier GUI now loads single spectra, LabSpec `.h5` files and one-file-per-spot map folders. It has three new tabs: stacked publication spectra (4), 1L/2L layer prediction against reference datasets (5), and Lorentzian peak fitting with Si calibration, background models, automatic or manual peak count and an ω_G–ω_2D strain/doping plot (6). The ML and BL RuCl₃ maps have been analysed. Both cover the same flake: a 1L strip on hBN, plus 2L that is partly on hBN and partly on RuCl₃, where G splits into G⁻/G⁺. The user's ω_G–ω_2D figure has been reproduced by layer and substrate. Committed and pushed as branch `stacked-spectra-and-folder-maps` on the fork (`ae10455`). Next steps: get the published strain/doping constants, then decide on extending to more layers.
 
 ## 2. Files
 Repo: `~/Github/Raman_Classifier` (fork `aaloktrii/Raman_Classifier`, upstream `sagnikbajpeyi-rgb/Raman_Classifier`).
 
 | file | what it is | status |
 |---|---|---|
-| `raman_map_classifier_8 (1).py` | the GUI (original tabs 1–3 + new 4 Stacked spectra, 5 Layer prediction, 6 Peak fitting; Map selector FWHM/G/2D height in tab 1; File ▸ Open map folder…) | modified, uncommitted |
-| `raman_tools.py` | Si calibration, backgrounds (linear / polynomial / ALS), Lorentzian fit with fixed or auto peak count, analytic Jacobian | new, uncommitted |
-| `raman_peak_fit.py` | per-dataset Lorentzian G/2D fits (auto G⁻/G⁺ split) → `fits.csv`, `summary.csv` (mean ± SD), PDFs | new, uncommitted |
-| `graphene_reference.py` | build 1L/2L reference JSON; predict layer number + stacking per spectrum | new, uncommitted |
-| `strain_doping.py` | ω_G–ω_2D Lee-2012 decomposition, substrate detection, peak counts, correlation plot | new, uncommitted |
+| `raman_map_classifier_8 (1).py` | the GUI (original tabs 1–3 + new 4 Stacked spectra, 5 Layer prediction, 6 Peak fitting; Map selector FWHM/G/2D height in tab 1; File ▸ Open map folder…) | committed |
+| `raman_tools.py` | Si calibration, backgrounds (linear / polynomial / ALS), Lorentzian fit with fixed or auto peak count, analytic Jacobian | committed |
+| `raman_peak_fit.py` | per-dataset Lorentzian G/2D fits (auto G⁻/G⁺ split) → `fits.csv`, `summary.csv` (mean ± SD), PDFs | committed |
+| `graphene_reference.py` | build 1L/2L reference JSON; predict layer number + stacking per spectrum | committed |
+| `strain_doping.py` | ω_G–ω_2D Lee-2012 decomposition, substrate detection, peak counts, correlation plot | committed |
 | `reference/graphene_reference.json` (+ `1L_ML_hBN_RuCl3/`, `2L_BL_hBN_RuCl3/`, `reference_summary.pdf`) | the 1L/2L reference values used for prediction | generated |
 | `reference/strain_doping/strain_doping_combined.{pdf,csv}` | reproduced ω_G–ω_2D figure, both maps | generated |
 | `build_training_data.py`, `training_data/` | earlier copy-into-1L/2L approach, superseded by `reference/` | obsolete: delete? |
@@ -69,7 +69,7 @@ Data (not in repo): `~/Downloads/ML_hBN_RuCl3_532nm_map1_2__X_-2372` (192 spots,
 
 ## 7. Open items (next session)
 - [ ] Get the published ω_G0, ω_2D0 and doping rate from the user's paper and set `strain_doping.PARAMS`; the current values are read off the figure.
-- [ ] Commit the branch and push to the fork (user has not yet approved).
+- [x] Commit the branch and push to the fork: `ae10455`, `origin/stacked-spectra-and-folder-maps`. `training_data/` and `build_training_data.py` left out (untracked).
 - [ ] Delete `build_training_data.py` + `training_data/` (superseded) if the user agrees.
 - [ ] Check 007_02/1_r1 (broad, blue-shifted 2D) and the ~10 "1L on RuCl₃" spots (likely boundary spots).
 - [ ] Predict the user's real new dataset: `graphene_reference.py predict <folder>` or tab 5. There is no `new_dataset` folder; that name was a placeholder.
@@ -85,4 +85,5 @@ Data (not in repo): `~/Downloads/ML_hBN_RuCl3_532nm_map1_2__X_-2372` (192 spots,
 6. Parallel tests must run from a script file, not stdin: spawn workers re-import `__main__`.
 
 ## 9. Session log
+- 2026-10-12: branch committed (`ae10455`) and pushed to the fork; status and Files updated.
 - 2026-10-06 → 10: handoff created. Covers the fork setup, tabs 4–6, the references, Si calibration, substrate detection, peak counting, and the reproduced ω_G–ω_2D figure.
